@@ -1,0 +1,641 @@
+---
+title: "16S_Analysis_Clean"
+author: "Jordan_T"
+date: "2025-11-11"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#Load required packaged
+library(dada2)
+library(microViz)
+library(phyloseq)
+library(vegan)
+library(dplyr)
+library(vctrs)
+library(patchwork)
+library(ggplot2)
+library(ALDEx2)
+library(tibble)
+library(microbiome)
+library(svglite)
+library(sjPlot)
+library(ggside)
+library(ANCOMBC)
+library(openxlsx)
+```
+
+*Load your phyloseq object, some extra cleaning, and a variety of optional steps*
+```{r}
+load("C:/Users/thaka/OneDrive - McGill University/GENICEII/2024_experiment_data/16S_CMO_2024/CMO_2024_Experiment_16S_Amplicon_ps_loessnonR.Rda") #Load your phyloseq
+METADATA<-read.csv("C:/Users/thaka/OneDrive - McGill University/GENICEII/2024_experiment_data/16S_CMO_2024/16S_meta_with_readcount_CMO2024.csv")
+rownames(METADATA) <- METADATA$genohubname
+METADATA <- sample_data(METADATA)
+sample_data(ps) <- METADATA
+#Below is some extra tweaks/cleaning. I prefer to do them here and leave the raw phyloseq as a backup, but it likely doesn't matter too much.
+
+ps<- tax_fix(ps) #Replaces NAs in taxonomy with the next available classification at a higher taxonomic level. This step is necessary for some plotting functions and statistical tests.
+ps<-ps %>% tax_fix(unknowns = c("Unknown Family"))
+ps=subset_samples(ps, pool !="EXTERNAL")
+ps=subset_samples(ps, pool !="")
+
+```
+
+**Condensing replicate samples to the one with the most reads (OPTIONAL)** #THINK ABOUT DEDUPING A,B,C REPLICATES
+```{r}
+ps1<- ps1 %>% ps_dedupe(method="readcount", verbose=TRUE, vars="sample") #Replace "dedupe" with the metadata variable that you are selecting the replicates by.
+psu<- psu %>% ps_dedupe(method="readcount", verbose=TRUE, vars="sample", n = 2) #Replace "dedupe" with the metadata variable that you are selecting the replicates by.
+```
+
+**Adding extra metadata to a phyloseq (OPTIONAL)**
+```{r}
+#If you need to add some extra columns to the sample data in a pre-existing phyloseq, we will have to load the new phyloseq file and append the columns we want. See the example below:
+
+metadata<- read.csv("C:/Users/thaka/amplicon_datasets/GENICEII_amplicons/2024_sequencing/fastqfiles/16S/CMO_2024_Amplicon_Metadata_16S.csv", row.names = 1) #Load your metadata
+
+sample_data(ps1)$variable1<- metadata[rownames(sample_data(ps1)), "variable1"]
+```
+
+**Factoring variables in metadata for cleaner plotting (OPTIONAL)**
+```{r}
+#I like to make variables factors so that they automatically order themselves in the plots. This step will also require that you upload the metadata file (as above) and factor that, then transfer it into the phyloseq. If you make copies of the phyloseq (e.g., one with just a subset of the samples, the factoring may not carry over and you may need to redo this).
+
+meta<-ps1@sam_data
+
+# Factor the variable
+meta$depths <- factor(meta$depths, 
+                         levels = c("Unveg", "D3", "D2", "D1")) #Input variables in the desired order.
+
+# Convert back to sample_data object
+sample_data(ps1) <- sample_data(meta)
+
+# Check
+str(sample_data(ps1)$depths)
+```
+
+**Subsetting a select # of samples for plotting (OPTIONAL)**
+```{r}
+#If you only want to plot a certain subset of samples, follow the code below. This will make a copy phyloseq that we will give a different name. Just plug this phyloseq instead into all the code below for ordinations/plots.
+
+ps1m<- subset_samples(ps, variable1=="yes") #Note: double equal signs means "exactly equals", while !=  is used for "does not equal" whatever input value you use. In this case, we are subsetting samples where variable1 (in the metadata) is equal to "yes".  
+```
+
+**Creating a consistent palette for plotting taxa**
+```{r}
+#Say you have a multiple sample groups that do not all easily plot into the same image. You can ensure the labelling scheme for taxa is identical between different plots to easily compare taxa.
+
+#Create a consistent colour palette for taxa :)
+kingdom_palette <- tax_palette(ps1, rank = "Kingdom", pal = "brewerPlus", n = 40, add = c(Other = "black"))
+kingdom_palette %>% tax_palette_plot() # just to check the palette
+
+phylum_palette <- tax_palette(ps1, rank = "Phylum", pal = "brewerPlus", n = 40, add = c(Other = "black"))
+phylum_palette %>% tax_palette_plot() # just to check the palette
+
+genus_palette <- tax_palette(ps1, rank = "Genus", pal = "brewerPlus", n = 41, add = c(Other = "black"))
+genus_palette %>% tax_palette_plot() # just to check the palette
+
+class_palette <- tax_palette(ps1, rank = "Class", pal = "brewerPlus", n = 40, add = c(Other = "black"))
+class_palette %>% tax_palette_plot() # just to check the palette
+
+order_palette <- tax_palette(ps1, rank = "Order", pal = "brewerPlus", n = 40, add = c(Other = "black"))
+order_palette %>% tax_palette_plot() # just to check the palette
+
+family_palette <- tax_palette(ps1, rank = "Family", pal = "brewerPlus", n = 40, add = c(Other = "black"))
+family_palette %>% tax_palette_plot() # just to check the palette
+```
+
+*Standard Diversity Metrics*
+```{r}
+#Observed ASVs (you can also change "Observed" to other diversity calculations supported by the plot_richness function)
+pro_div<-estimate_richness(ps1)
+print(pro_div)
+write.csv(pro_div, "C:/Users/thaka/OneDrive/Glasauer_DustPaper_Clean_2026/Sequencing_data/16S/prok_diversity_dust.csv") #Change with your desired file name
+
+#Note- you can easily modify these plots by pipelining into ggplot. If you want code for that let me know :)
+```
+
+*PERMANOVA*
+```{r}
+#PERMANOVA is the standard statistical tests for compositional sequencing data. You can test if overall community structures are significantly different between sample groups. This will not say which taxa are driving these changes (we will have to use a differential abundance test for that (later)).
+
+ps_perm <- ps %>%
+  tax_transform("identity") %>%
+  dist_calc("aitchison") %>%
+  dist_permanova(
+    variables = c("experiment_day", "medium", "pool"),
+    interactions = c("experiment_day*medium"),
+    n_perms = 999, # you should use more permutations in your real analyses!
+    n_processes = 1
+  )
+ps_perm %>% perm_get()
+```
+
+*BETA DISPERSION*
+```{r}
+#BETA Dispersion tests are typically paired with a PERMANOVA to better clarify if any significant differences between test groups are due to differences in the average community location (a function of presence/absence and relative abundances) and/or the intra-group variation (i.e., variation between sample replicates). More simply, the BETA dispersion test will tell you if the difference in intra-group variation between two sample groupings is statistically significant. 
+betadisperse<-ps %>%
+  tax_transform("identity") %>%
+  dist_calc("aitchison") %>%
+  dist_get()
+
+beta<-betadisper(betadisperse, group = sample_data(ps)$medium, type = "centroid")
+perm_test<- permutest(beta)
+print(perm_test)
+```
+ps1b= subset_samples(ps1, treatmentsss != "FP")
+
+*Differential Abundance*
+**Aldex2**
+#We will use the ALDEX2 differential abundance test. This approach takes read depth into account (which is why we did not rarify our reads earlier on). This test also accounts for compositionality, and is quite conservative and robust in how it subsamples our data to test each taxa.
+```{r}
+#create taxa info files
+x <- subset_samples(ps1, depths != "D1")
+
+if (!require('ALDEx2')) BiocManager::install("ALDEx2"); library('ALDEx2')
+x=ps
+taxa_info <- data.frame(tax_table(x))
+taxa_info <- taxa_info %>% rownames_to_column(var = "OTU")
+
+#this is to identify differences
+reads<-data.frame(abundances(x))
+conds<-sample_data(x)$depths #CHANGE TO THE SAMPLING GROUPING YOU WANT TO TEST!!!!!!!!
+
+#Run ALDEx2 - this code does a clr transformation, then applies differential abundance testing and estimates effect sizes
+#look at the documentation for this code. I'm running a T-test/wilcoxon test here but for more than two categorical variables you'll need to run kruskall-wallis tests ("kw")
+aldex2_da <- aldex(reads, conds, test="t", effect = TRUE, verbose = TRUE, CI = FALSE, denom="all")
+aldex2_output_OTU<-cbind(taxa_info,aldex2_da)
+write.csv(aldex2_da, "path/to/file.csv") #Change with your desired file name
+aldex.plot(aldex2_output_OTU, type = "volcano")
+```
+
+**ANCOM-BC**
+#Analysis of Compositions of Microbiomes with Bias Correction 2 (ANCOM-BC2) is another popular differential abundance technique. Below we will use the global test function to generate: 1) test statistics; 2) p-values; 3) adjusted p-values; 4) indicators whether the taxon is differentially abundant (TRUE) or not (FALSE). 
+
+```{r}
+library(ANCOMBC)
+library(DT)
+#Set control as reference level
+ps2 <- subset_samples(ps2, treatment != "Unveg_Tailings")
+ps2@sam_data$treatment = factor(ps2@sam_data$treatment, levels = c("NT", "T"))
+
+#Running ancombc2 for a phyloseq object
+set.seed(123)
+# It should be noted that we have set the number of bootstrap samples (B) equal 
+# to 10 in the 'trend_control' function for computational expediency. 
+# However, it is recommended that users utilize the default value of B, 
+# which is 100, or larger values for optimal performance.
+output = ancombc2(data = ps2, tax_level = "Genus",
+                  fix_formula = "treatment + depth + time", rand_formula = NULL,
+                  p_adj_method = "holm", pseudo_sens = TRUE,
+                  prv_cut = 0.10, lib_cut = 1000, s0_perc = 0.05,
+                  group = "treatment", struc_zero = TRUE, neg_lb = TRUE,
+                  alpha = 0.05, n_cl = 2, verbose = TRUE,
+                  global = TRUE, pairwise = TRUE, dunnet = TRUE, trend = TRUE,
+                  iter_control = list(tol = 1e-2, max_iter = 20, 
+                                      verbose = TRUE),
+                  em_control = list(tol = 1e-5, max_iter = 100),
+                  lme_control = lme4::lmerControl(),
+                  mdfdr_control = list(fwer_ctrl_method = "holm", B = 100),
+                  trend_control = list(contrast = list(matrix(c(1, 0, -1, 1),
+                                                              nrow = 2, 
+                                                              byrow = TRUE),
+                                                       matrix(c(-1, 0, 1, -1),
+                                                              nrow = 2, 
+                                                              byrow = TRUE),
+                                                       matrix(c(1, 0, 1, -1),
+                                                              nrow = 2, 
+                                                              byrow = TRUE)),
+                                       node = list(2, 2, 1),
+                                       solver = "ECOS",
+                                       B = 10))
+res_prim = output$res
+
+#Plotting significant taxa
+df_treatment = res_prim %>%
+    dplyr::select(taxon, contains("treatment")) 
+df_fig_treatment1 = df_treatment %>%
+    dplyr::filter(diff_treatmentT == 1) %>%
+    dplyr::mutate(lfc1 = ifelse(diff_treatmentT == 1, 
+                                round(lfc_treatmentT, 2), 0)) %>%
+    tidyr::pivot_longer(cols = lfc1, 
+                        names_to = "group", values_to = "value") %>%
+    dplyr::arrange(taxon)
+
+df_fig_treatment2 = df_treatment %>%
+    dplyr::filter(diff_treatmentT == 1) %>%
+    dplyr::mutate(lfc1 = ifelse(diff_robust_treatmentT, 
+                                "aquamarine3", "black")) %>%
+    tidyr::pivot_longer(cols = lfc1, 
+                        names_to = "group", values_to = "color") %>%
+    dplyr::arrange(taxon)
+
+df_fig_treatment = df_fig_treatment1 %>%
+    dplyr::left_join(df_fig_treatment2, by = c("taxon", "group"))
+
+df_fig_treatment$group = recode(df_fig_treatment$group, 
+                          `lfc1` = "T - Tailings")
+df_fig_treatment$group = factor(df_fig_treatment$group, 
+                          levels = c("T - Tailings"))
+  
+lo = floor(min(df_fig_treatment$value))
+up = ceiling(max(df_fig_treatment$value))
+mid = (lo + up)/2
+fig_treatment = df_fig_treatment %>%
+  ggplot(aes(x = group, y = taxon, fill = value)) + 
+  geom_tile(color = "black") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       na.value = "white", midpoint = mid, limit = c(lo, up),
+                       name = NULL) +
+  geom_text(aes(group, taxon, label = value, color = color), size = 4) +
+  scale_color_identity(guide = "none") +
+  labs(x = NULL, y = NULL, title = "Log fold changes as compared to control samples") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+fig_treatment
+```
+
+**Relative Abundance Catalog**
+```{r}
+#I like to export relative abundance at the beginning to have as an easy reference (1 file!) while I am exploring the data with ordinations and compositional barplots. All the intermediate objects are automatically removed from your environment at the end :). NOTE: Depending on how your phyloseq object is set up, you made be able to skip all the transposing steps below.
+#remove any taxa and samples that sum to 0
+relps<- phyloseq::prune_taxa(phyloseq::taxa_sums(ps1) > 0, ps1)
+relps<- phyloseq::prune_samples(phyloseq::sample_sums(relps) > 0, relps)
+
+#Relative abundance grouped by taxonomic level
+relabun<-tax_transform(relps,trans="compositional")
+#kingdomGlommed<- tax_transform(relps,rank="Kingdom",trans="compositional")
+phylumGlommed<- tax_transform(relps,rank="Phylum",trans="compositional")
+classGlommed<- tax_transform(relps,rank="Class",trans="compositional")
+orderGlommed<- tax_transform(relps,rank="Order",trans="compositional")
+familyGlommed <- tax_transform(relps,rank="Family",trans="compositional")
+genusGlommed <- tax_transform(relps,rank="Genus",trans="compositional")
+
+#Match the structure of tax_table and count table
+relabunT <- data.frame(tax_table(relabun))
+#relabunT <- relabunT %>% rownames_to_column(var = "OTU")
+relabunO<- data.frame(otu_table(relabun))
+#relabunO<- t(relabunO)
+
+#kingdomGlommedT <- data.frame(tax_table(kingdomGlommed))
+#kingdomGlommedO<- data.frame(otu_table(kingdomGlommed))
+#kingdomGlommedO<- t(kingdomGlommedO)
+
+phylumGlommedT <- data.frame(tax_table(phylumGlommed))
+phylumGlommedO<- data.frame(otu_table(phylumGlommed))
+#phylumGlommedO<- t(phylumGlommedO)
+
+classGlommedT <- data.frame(tax_table(classGlommed))
+classGlommedO<- data.frame(otu_table(classGlommed))
+#classGlommedO<- t(classGlommedO)
+
+orderGlommedT <- data.frame(tax_table(orderGlommed))
+orderGlommedO<- data.frame(otu_table(orderGlommed))
+#orderGlommedO<- t(orderGlommedO)
+
+familyGlommedT <- data.frame(tax_table(familyGlommed))
+familyGlommedO<- data.frame(otu_table(familyGlommed))
+#familyGlommedO<- t(familyGlommedO)
+
+genusGlommedT <- data.frame(tax_table(genusGlommed))
+genusGlommedO<- data.frame(otu_table(genusGlommed))
+#genusGlommedO<- t(genusGlommedO)
+
+
+#combine dataframes
+Spp_relabun<-cbind(relabunT, relabunO)
+#King_relabun<-cbind(kingdomGlommedT, kingdomGlommedO)
+Phy_relabun<-cbind(phylumGlommedT, phylumGlommedO)
+Class_relabun<-cbind(classGlommedT, classGlommedO)
+Ord_relabun<-cbind(orderGlommedT, orderGlommedO)
+Fam_relabun<-cbind(familyGlommedT, familyGlommedO)
+Gen_relabun<-cbind(genusGlommedT, genusGlommedO)
+
+#Export all tax levels into one spreadsheet with different tabs :)  (Note: add in kingdom if you need, for ITS data, the kingdom classification is not often there)
+data_frames <- list("ASV" = Spp_relabun, "Phylum" = Phy_relabun, "Class" = Class_relabun , "Order" = Ord_relabun, "Family" = Fam_relabun, "Genus" = Gen_relabun)
+write.xlsx(data_frames,
+           file = "C:/Users/thaka/OneDrive/Glasauer_DustPaper_Clean_2026/Sequencing_data/ITS/ITS_relabun_DM.xlsx")
+
+#export if you'd like
+#write.csv(Spp_relabun,file="relabun_ASV.csv")
+#write.csv(Gen_relabun,file="relabun_genus.csv")
+#write.csv(Fam_relabun,file="relabun_fam.csv")
+#write.csv(Ord_relabun,file="relabun_ord.csv")
+#write.csv(Class_relabun,file="relabun_class.csv")
+#write.csv(Phy_relabun,file="relabun_phy.csv")
+
+#remove items so they don't clutter up your life :)
+rm(list=c("relps","kingdomGlommed","phylumGlommed","classGlommed","orderGlommed","familyGlommed","genusGlommed","relabun","Spp_relabun","King_relabun","Phy_relabun","Class_relabun","Ord_relabun","Fam_relabun","Gen_relabun", "relabunO",  "relabunT","kingdomGlommedT","phylumGlommedT","classGlommedT","orderGlommedT","familyGlommedT","genusGlommedT","kingdomGlommedO","phylumGlommedO","classGlommedO","orderGlommedO","familyGlommedO","genusGlommedO", "data_frames"))
+```
+
+**Optional addition of FUNGuild assignments (fungal sequencing only)**
+*Process fungal samples through FUNGuild dataset*
+```{r}
+library(tibble)
+library(file2meco)
+library(funrar)
+library(microeco)
+library(magrittr)
+library(ggplot2)
+library(agricolae)
+library(FSA)
+library(rcompanion)
+library(file2meco)
+
+dataset<-phyloseq2meco(ps1)
+dataset$tidy_dataset()
+dataset$sample_table$treatment_ordered %<>% factor(., levels = c("A", "B", "C"))
+
+t1 <- trans_func$new(dataset)
+# Both FungalTraits and FUNGuild are available
+t1$cal_spe_func(fungi_database = "FUNGuild")
+t1$cal_spe_func_perc(abundance_weighted = TRUE)
+
+#Compare relative abundances of trophic guilds (not necessary for placing trophic guild info in the relative abundance catalog)
+# clone meco_fungi for differential test
+tmp_mt <- clone(dataset)
+# we need assign the table to taxa_abund manually
+tmp_mt$taxa_abund$func <- as.data.frame(t(t1$res_spe_func_perc), check.names = FALSE)
+# use trans_diff class to perform differential test
+
+pdf(file = "C:/Users/thaka/amplicon_datasets/GENICEII_amplicons/2024_sequencing/GENICEII_2024_Amplicons/ITS_Funguild_Finalplot_2025.pdf",
+    width = 11,
+    height = 8.5)
+```
+
+*Export funguild assignments to add to relative abundance catalog*
+#Note, this analysis only requires relative abundances to be calculated at the ASV level, as the FUNGUILD dataset is applying assignments at the ASV level.
+#Note, some of the variables were already set in the relative abundance catalog (code above), so be sure to run that first!
+```{r}
+fun_assign = t1$res_spe_func_raw_funguild
+fun_assign$unique = row.names(fun_assign)
+fun_assign_t = cbind(fun_assign, relabunT, by = "unique")
+
+fun_assign_t =  relabunT %>%
+    dplyr::left_join(fun_assign, by = c("unique"))
+row.names(fun_assign_t) = fun_assign_t$unique
+fun_rel<-cbind(fun_assign_t, relabunO) #This will ensure relative abundances of ASVs matched by FUNGUILD are relative to the total community and not just within the pool of FUNGUILD matches
+write.xlsx(fun_rel,
+           file = "C:/Users/thaka/OneDrive/Glasauer_DustPaper_Clean_2026/Sequencing_data/ITS/ITS_relabun_DM_with_funguild.xlsx")
+```
+
+**Ordinations**
+```{r}
+#Below is some code for running ordinations/clustering data based on community structure to visually see trends. I typically use a PCoA plot with an Aitchison distance matrix (appears to be the most robust for microbiome data). 
+
+#Luckily MicroViz has a great visualization tool through the shiny platform. Here you can just input the phyloseq object, and play around with the parameters, visualize clustering, and even generate relative abundance plots (if you double click a sample). If you create the plot you want through this tool, you can copy the code directly from there and input it into your R markdown file.
+
+ord_explore(ps1) #NOTE: You will have to manually click stop on the code before moving forward (the code runs while you use the webpage).
+
+#Below is code I used to generate my ordination plots.
+```
+
+**PCoA Plots- Aitchison Distance** 
+#See the MicroViz tutorial for all the great addons you can use to customize your ordination plots: https://david-barnett.github.io/microViz/articles/web-only/ordination.html 
+```{r}
+ps1_ord <- ps1m %>% tax_filter(min_prevalence = 0.05, tax_level = "Genus") #Ordinations don't do too well with taxa that are really low in relative abundance in only a couple of samples. Here we are selecting for taxa that are atleast prevelent in 5% of our samples. HOW YOU FILTER WILL DEPEND ON YOUR SAMPLES. 
+
+#Note: We are using an aitchison distance matrix for the PCoA plot. This requires the data are center-log ratio (CLR) transformed; HOWEVER, the code below automatically does this when the aitchison distance matrix is applied. I am writing this note to say that you do not need to clr transform prior to this code.
+
+#ASV-level
+ps1_ord %>%
+  tax_transform("identity") %>%
+  dist_calc(dist = "aitchison") %>%
+  ord_calc("PCoA") %>%
+  ord_plot(color = "pool_corrected", shape = "medium_simple", size = 2) +
+  scale_colour_brewer(palette = "Dark2")
+
+#Genus-level (with some extra funky add-ons)
+pcoa_genus<-ps1_ord %>%
+  tax_transform("identity", rank = "Genus") %>%
+  dist_calc(dist = "aitchison") %>%
+  ord_calc("PCoA") %>%
+  ord_plot(color = "pool_corrected", shape = "medium", size = 2) +
+  scale_colour_brewer(palette = "Dark2")
+pcoa_genus + labs(color = "Pool", shape = "Medium") +
+  theme_bw() +
+  ggside::geom_xsideboxplot(aes(fill = medium, y = medium), orientation = "y") +
+  ggside::geom_ysideboxplot(aes(fill = medium, x = medium), orientation = "x") +
+  ggside::scale_xsidey_discrete(labels = NULL) +
+  ggside::scale_ysidex_discrete(labels = NULL) +
+  ggside::theme_ggside_void()
+dev.off()
+```
+
+**PCA ordination**
+#In my experience this will generate a similar plot to PCoAs. However, you can also add taxonomic loading onto PCAs (which does not seem applicable to PCoAs from what I know). This may be useful for generally exploring the data, but you should also assess this through statistical tests.
+```{r}
+if (!require('microViz')) remotes::install_github("david-barnett/microViz"); library('microViz')
+ps %>%
+  tax_transform("clr", rank = "Genus") %>%
+  ord_calc("PCA") %>%
+  ord_plot(color = "variable1", shape = "variable2", plot_taxa = 1:10, size = 2) +
+  scale_colour_brewer(palette = "Dark2")
+```
+
+*Compositional Barplots*
+```{r}
+#Here is the baseline code for a nice compositional barplot from the microviz package. I also have a faceting variable added (it is easily compatible with ggplot).
+pss1<-subset_samples(ps1, replicate_across_depth == "CP")
+pss2<-subset_samples(ps1, replicate_across_depth == "NT-T1")
+pss3<-subset_samples(ps1, replicate_across_depth == "T-T1")
+pss4<-subset_samples(ps1, replicate_across_depth == "NT-T2")
+pss5<-subset_samples(ps1, replicate_across_depth == "T-T2")
+
+
+pdf(file = "C:/Users/thaka/amplicon_datasets/GENICEII_amplicons/2024_sequencing/GENICEII_2024_Amplicons/16S_Genus_Formatted2025.pdf",
+    width = 11,
+    height = 8.5)
+pss1 %>%
+  comp_barplot("Family", n_taxa = 15, merge_other = FALSE, label = "depths", sample_order = c("16S-1", "16S-2", "16S-3"), palette = family_palette, facet_by = "replicate_across_depth") +
+  ggtitle(
+    "Dust experiment ITS_1"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold")) + 
+  labs(x = "Depth", y = "Relative abundance (%)")
+pss2 %>%
+  comp_barplot("Family", n_taxa = 15, merge_other = FALSE, label = "depths", sample_order = c("16S-4", "16S-5", "16S-6"), palette = family_palette, facet_by = "replicate_across_depth") +
+  ggtitle(
+    "Dust experiment ITS_2"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold")) + 
+  labs(x = "Depth", y = "Relative abundance (%)")
+pss3 %>%
+  comp_barplot("Family", n_taxa = 15, merge_other = FALSE, label = "depths", sample_order = c("16S-7", "16S-8", "16S-9"), palette = family_palette, facet_by = "replicate_across_depth") +
+  ggtitle(
+    "Dust experiment ITS_3"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold")) + 
+  labs(x = "Depth", y = "Relative abundance (%)")
+pss4 %>%
+  comp_barplot("Family", n_taxa = 15, merge_other = FALSE, label = "depths", sample_order = c("16S-10", "16S-11", "16S-12"), palette = family_palette, facet_by = "replicate_across_depth") +
+  ggtitle(
+    "Dust experiment ITS_4"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold")) + 
+  labs(x = "Depth", y = "Relative abundance (%)")
+pss5 %>%
+  comp_barplot("Family", n_taxa = 15, merge_other = FALSE, label = "depths", sample_order = c("16S-13", "16S-14", "16S-15"), palette = family_palette, facet_by = "replicate_across_depth") +
+  ggtitle(
+    "Dust experiment ITS_5"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold")) + 
+  labs(x = "Depth", y = "Relative abundance (%)")
+psu %>%
+  comp_barplot("Family", n_taxa = 15, merge_other = FALSE, label = "depths", palette = family_palette, facet_by = "replicate_across_depth") +
+  ggtitle(
+    "Dust experiment ITS_6"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold")) + 
+  labs(x = "Depth", y = "Relative abundance (%)")
+
+dev.off()
+```
+
+```{r}
+#Here is the baseline code for a nice compositional barplot from the microviz package. I also have a faceting variable added (it is easily compatible with ggplot).
+pss<-subset_samples(ps1, depth == "1")
+pss %>% 
+  tax_fix()
+pdf(file = "C:/Users/thaka/amplicon_datasets/GENICEII_amplicons/2024_sequencing/GENICEII_2024_Amplicons/16S_comp_Order_2025.pdf",
+    width = 11,
+    height = 8.5)
+king<-ps1 %>%
+  comp_barplot("Kingdom", n_taxa = 15, merge_other = FALSE, label = "name", palette = kingdom_palette, facet_by = "time") +
+  ggtitle(
+    "Dust experiment ITS"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold")) + 
+  labs(x = "Time (months)", y = "Relative abundance (%)")
+
+pss<-subset_samples(ps1, depth == "2")
+pss %>% tax_fix()
+
+pss %>%
+  comp_barplot("Order", n_taxa = 15, merge_other = FALSE, label = "name", palette = order_palette, facet_by = "time") +
+  ggtitle(
+    "Dust experiment ITS"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold")) + 
+  labs(x = "Time (months)", y = "Relative abundance (%)")
+
+pss<-subset_samples(ps1, depth == "3")
+pss %>% tax_fix()
+
+pss %>%
+  comp_barplot("Order", n_taxa = 15, merge_other = FALSE, label = "name", palette = order_palette, facet_by = "time") +
+  ggtitle(
+    "Dust experiment ITS"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold")) + 
+  labs(x = "Time (months)", y = "Relative abundance (%)")
+dev.off()
+```
+*Composition heatmaps*
+#I find heatmaps help to highlight specific taxa that are changing the most between samples (or are the most abundant in your samples).
+```{r}
+#The filtering parameters can easily be tuned to better fit your samples. This code will also label samples by one variable (e.g., pool). Feel free to change this with something in your metadata (it is easiest when its a binary variable, but it does not have to be).
+ps1 %>%
+  tax_transform(trans = "clr", rank = "Genus") %>%
+  tax_filter(min_prevalence = 0.1, min_sample_abundance = 300, use_counts = TRUE) %>%
+  comp_heatmap(
+    colors = heat_palette(sym = TRUE), grid_col = NA,
+    tax_anno = taxAnnotation(
+      Prev. = anno_tax_prev(bar_width = 0.3, size = grid::unit(1, "cm"))
+    ),
+    sample_side = "bottom", name = "CLR",
+    sample_anno = sampleAnnotation(
+      "pool" = anno_sample("pool_corrected"),
+      col = list("pool" = c(
+        "EXP" = "black", "CTL" = "#2BD9FE"
+      ))
+    )
+  )
+```
+
+**Plotting taxa with statistically significant differences**
+#The chosen taxa may be from one differential abundance test or by using a consensus approach across multiple techniques.
+```{r}
+# Taxa of interest (the taxa that were statistically significant in the ALDEX2 output)
+taxa_of_interest <- c("Saitozyma", "Ganoderma", "Clavaria", "Amblyosporium")
+
+# Filter phyloseq object to keep only these taxa
+rel<-aggregate_taxa(ps2, 'Genus')
+rel<-tax_transform(rel,trans="compositional") #This must come first to retain the composition of each ASV in the whole community, not just in our subset.
+ps_sub <- prune_taxa(taxa_names(rel) %in% taxa_of_interest, rel)
+
+df <- psmelt(ps_sub)
+
+df$day_numeric <- as.numeric(gsub("//D", "", df$day_number))
+df$day_numeric <- factor(df$day_numeric, levels = sort(unique(df$day_numeric)))
+
+library(tidyr)
+
+df_complete <- df %>%
+  complete(Sample, OTU, fill = list(abundance = 0, group = first("treatment"), time = first("time"))) #Psmelt will get rid of zero, filling them in just for the plot. But note that 0 in this case can be true, or just below detection, or a sequencing error.
+
+
+# Rename columns for convenience
+df_complete <- df_complete %>%
+  rename(
+    asv = asv,             # OTU column contains ASV IDs
+    abundance = abundance,
+    time = time, # replace with your time variable
+    group = group  # replace with your experimental group variable
+  )
+
+label_days <- levels(df_complete$time)[seq(1, length(levels(df_complete$time)), by = 5)]
+
+ggplot(df_complete, aes(x = time, y = abundance, color = group)) +
+  geom_line(aes(group = group), linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ asv, scales = "free_y") +  # each ASV gets its own panel
+  theme_bw() +
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    axis.text.x = element_text(angle = -90, hjust = 1, vjust = 0.5)  # rotate 45 degrees
+  ) +
+  labs(
+    x = "Time (days)",
+    y = "Relative abundance",
+    color = "treatment"
+  )
+```
+
+*Testing Shared ASVs*
+```{r}
+library(microeco)
+library(magrittr)
+library(microeco)
+library(file2meco)
+
+mt<-phyloseq2meco(ps1)
+head(mt$sample_table)
+mt <- mt$merge_samples("treatments")
+
+venn <- trans_venn$new(mt, ratio = "seqratio")
+venn$res_venn
+venn$plot_venn()
+
+# transform venn results to the sample-species table, here do not consider abundance, only use presence/absence.
+t2 <- venn$trans_comm(use_frequency = TRUE)
+# t2 is a new microtable class, each part is considered a sample
+class(t2)
+
+t2$cal_abund()
+# transform and plot
+t3 <- trans_abund$new(dataset = t2, taxrank = "Family", ntaxa = 8)
+t3$plot_bar(bar_full = FALSE, legend_text_italic = T, xtext_angle = 30, color_values = RColorBrewer::brewer.pal(8, "Set2"),
+    order_x = c("NT", "UVT", "T", "NT&T", "NT&UVT", "T&UVT")) + ylab("Frequency (%)")
+```
+
+*Pulling actual sequences from ASVs names to query in BLAST*
+```{r}
+#I just threw this in here just in case you wanted to retrieve the sequence for a particulary ASV and run it in BLAST
+seqs <- refseq(ps1)
+as.character(seqs["ASV10"])
+```
