@@ -1,0 +1,344 @@
+---
+title: "GENICE2024_16S"
+author: "Jordan_T"
+date: "2025-09-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#Load required packaged
+library(dada2)
+library(microViz)
+library(phyloseq)
+library(vegan)
+library(dplyr)
+library(vctrs)
+library(patchwork)
+library(ggplot2)
+library(decontam)
+```
+
+*16S Samples*
+**Description of primer removal**
+```{r}
+#Removal of primers was performed with cutadapt in the commandline.With 2x250 bp sequencing, we are expecting the primers to only be present at the front of the reads, and not the reverse compliment. Code from commandline for reference:
+#for sample in $(cat samplenamefinal.txt)
+#do
+
+    #echo "On sample: $sample"
+    
+    #cutadapt -g ^GTGYCAGCMGCCGCGGTAA -G ^GGACTACNVGGGTWTCTAAT --discard-untrimmed -o ${sample}_1_trimmed.fq.gz -p ${sample}_2_trimmed.fq.gz ${sample}_1.fq ${sample}_2.fq  >> GENICE2024_cutadapt_primer_trimming_16Sstats.txt 2>&1
+
+#done
+#paste samplenamefinal.txt <(grep "passing" GENICE2024_cutadapt_primer_trimming_16Sstats.txt | cut -f3 -d "(" | tr -d ")") <(grep "filtered" GENICE2024_cutadapt_primer_trimming_16Sstats.txt | cut -f3 -d "(" | tr -d ")")  
+
+read.table("C:/Users/thaka/amplicon_datasets/GENICEII_amplicons/2024_sequencing/fastqfiles/16S/filter_pass.txt") 
+#First column is sequences retained and second is % of nucleotides retained. These values align well with the Happy Belly Bioinformatics (>90%, with the exception of one sample at 85%) and a 10-15% reduction in nucleotides with primer cutting.
+
+```
+
+**Description of adapter removal**
+```{r}
+#Adapters were removed using the FastP tool in unix. This tool works very similar to trimmomatic, but has a more up to date list of known Illumina adapter sequences. Adapter sequences are also automatically detected and removed. Additionally, low complexity sequences (<30% complexity) are trimmed. PolyG tails (which typically means no signal with NextSeq/NovaSeq machines) were also removed (minimum length of 10). For sequence complexity calculations, see: https://github.com/OpenGene/fastp?tab=readme-ov-file#low-complexity-filter 
+
+#for sample in $(cat samplenames.txt)
+#do
+
+    #echo "On sample: $sample"
+    
+    #fastp -i ${sample}_1_trimmed.fq -o ${sample}_1_trimmed_A.fq -I ${sample}_2_trimmed.fq -O ${sample}_2_trimmed_A.fq -Q -L -y -h ${sample}_Adapter_Trim.html -R "CMO2024_16S_Adapter_Trim"
+
+#done
+```
+
+**Processing through DADA2**
+```{r}
+#Establish path to FASTQ files
+path <- "C:/Users/thaka/amplicon_datasets/GENICEII_amplicons/2024_sequencing/fastqfiles/16S/primer_trimmed/fastp_processed/" # CHANGE ME to the directory containing the fastq files after unzipping.
+list.files(path)
+```
+```{r}
+#Next is performing a string manipulation to get matches lists of the forward and reverse fastq files.NOTE: This is from the tutorial, your names of files might change, and thus the string manipulation may have to be modified.You should then have forward and reverse organized into two separate lists (fnFs and fnRs). Then we extract the sample names.
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_1_trimmed_A.fq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_2_trimmed_A.fq", full.names = TRUE))
+
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_1_trimmed_A.fq"), `[`, 1)
+head(sample.names)
+```
+
+```{r}
+#Inspect read quality profiles- SEE THE DADA2 TUTORIAL for an explaination on quality scores: Your reads must still overlap after truncation (i.e., between forward and reverse sequences) in order to merge them later!  If you are using a less-overlapping primer set, like V1-V2 or V3-V4, your truncLen must be large enough to maintain 20 + biological.length.variation nucleotides of overlap between them. NOTE with this trial data, the reverse sequence is of much poorer quality, WHICH IS NORMAL. Regardless, it is good practice to trim the ends of both forward and reverse, depending on where the quality starts to plummet.
+plotQualityProfile("C:/Users/thaka/amplicon_datasets/GENICEII_amplicons/2024_sequencing/fastqfiles/16S/CGASH250708-16S-1_plate1-A01_1.fq") #Untrimmed sample to verify primer cutting went well.
+plotQualityProfile("C:/Users/thaka/amplicon_datasets/GENICEII_amplicons/2024_sequencing/fastqfiles/16S/CGASH250708-16S-1_plate1-A01_1.fq") #Trimmed but no adapter removal
+plotQualityProfile(fnFs[1:4]) 
+plotQualityProfile(fnRs[1:4])
+
+#The quality profiles look quite good! This also matches the multiqc report I drafted.
+```
+```{r}
+# Place filtered files in filtered/ subdirectory. NOTE: You don't need to change "path" since this is what you created at the beginning. This code is just creating the standard ending of the filtered reverse and forward files.
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+```{r}
+#After trimming primers, the reads are at slightly different lengths. After looking at the multiQC report (Sequence Length Distribution plot) for the average length of reads per sample, we will truncate to a consistent length of 225.The other parameters (quality based) are left on default from the DADA2 pipeline.
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=225,
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=FALSE) # On Windows set multithread=FALSE
+head(out)
+```
+
+**Learn the Error Rates**
+```{r}
+#The DADA2 algorithm makes use of a parametric error model (err) and every amplicon dataset has a different set of error rates. The learnErrors method learns this error model from the data, by alternating estimation of the error rates and inference of sample composition until they converge on a jointly consistent solution. As in many machine-learning problems, the algorithm must begin with an initial guess, for which the maximum possible error rates in this data are used (the error rates if only the most abundant sequence is correct and all the rest are errors).
+
+errF <- learnErrors(filtFs, nbases = 1e8, multithread=TRUE)
+errR <- learnErrors(filtRs, nbases = 1e8, multithread=TRUE)
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+```
+
+**Testing binned specific error learning**
+```{r}
+#Since NovaSeq uses binned quality scores (instead of unique quality scores for each read), the error-learning algorithm can run into some errors, and create messier error plots like the one above. I sifted through multiple forums on this issue, including QIIME2, and the consensus seems that DADA2 is still appropriate for NovaSeq data. However, if you notice some deviation in estimated error rate, then you can run the makeBinnedQualErrfun that specifies the bin values. For the NovaSeq 6000, the bin values are 2 (no signal), 12, 23, 37.
+binnedQs <- c(2,11,25,37)
+binnedQualErrfun <- makeBinnedQualErrfun(binnedQs)
+errF_bin <- learnErrors(filtFs, errorEstimationFunction=binnedQualErrfun, multithread=TRUE)
+errR_bin <- learnErrors(filtRs, errorEstimationFunction=binnedQualErrfun, multithread=TRUE)
+plotErrors(errF_bin, nominalQ=TRUE)
+plotErrors(errR_bin, nominalQ=TRUE)
+```
+
+**Loess Error Regression tests for error plots**
+```{r}
+loessErrfun_mod <- function (trans) {
+  qq <- as.numeric(colnames(trans))
+  est <- matrix(0, nrow = 0, ncol = length(qq))
+  for (nti in c("A", "C", "G", "T")) {
+    for (ntj in c("A", "C", "G", "T")) {
+      if (nti != ntj) {
+        errs <- trans[paste0(nti, "2", ntj), ]
+        tot <- colSums(trans[paste0(nti, "2", c("A",
+                                                "C", "G", "T")), ])
+        rlogp <- log10((errs + 1)/tot)
+        rlogp[is.infinite(rlogp)] <- NA
+        df <- data.frame(q = qq, errs = errs, tot = tot,
+                         rlogp = rlogp)
+        mod.lo <- loess(rlogp ~ q, df, weights = log10(tot), span = 2)
+        pred <- predict(mod.lo, qq)
+        maxrli <- max(which(!is.na(pred)))
+        minrli <- min(which(!is.na(pred)))
+        pred[seq_along(pred) > maxrli] <- pred[[maxrli]]
+        pred[seq_along(pred) < minrli] <- pred[[minrli]]
+        est <- rbind(est, 10^pred)
+      }
+    }
+  }
+  MAX_ERROR_RATE <- 0.25
+  MIN_ERROR_RATE <- 1e-07
+  est[est > MAX_ERROR_RATE] <- MAX_ERROR_RATE
+  est[est < MIN_ERROR_RATE] <- MIN_ERROR_RATE
+  err <- rbind(1 - colSums(est[1:3, ]), est[1:3, ], est[4,
+                                                        ], 1 - colSums(est[4:6, ]), est[5:6, ], est[7:8, ], 1 -
+                 colSums(est[7:9, ]), est[9, ], est[10:12, ], 1 - colSums(est[10:12,
+                                                                              ]))
+  rownames(err) <- paste0(rep(c("A", "C", "G", "T"), each = 4),
+                          "2", c("A", "C", "G", "T"))
+  colnames(err) <- colnames(trans)
+  return(err)
+}
+```
+
+```{r}
+errF_loess_nonR <- learnErrors(filtFs, errorEstimationFunction=loessErrfun_mod, multithread=TRUE)
+errR_loess_nonR <- learnErrors(filtRs, errorEstimationFunction=loessErrfun_mod, multithread=TRUE)
+plotErrors(errF_loess_nonR, nominalQ=TRUE)
+plotErrors(errR_loess_nonR, nominalQ=TRUE)
+```
+
+```{r}
+#We are now ready to apply the core sample inference algorithm to the filtered and trimmed sequence data.
+dadaFs<- dada(filtFs, err=errF_loess_nonR, multithread=TRUE)
+dadaRs<- dada(filtRs, err=errR_loess_nonR, multithread=TRUE)
+
+#Inspecting the returned dada-class object:
+dadaFs[[1]]
+```
+
+# We now merge the forward and reverse reads together to obtain the full denoised sequences. Merging is performed by aligning the denoised forward reads with the reverse-complement of the corresponding denoised reverse reads, and then constructing the merged “contig” sequences. By default, merged sequences are only output if the forward and reverse reads overlap by at least 12 bases, and are identical to each other in the overlap region (but these conditions can be changed via function arguments).
+```{r}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[1])
+```
+```{r}
+#We can now construct an amplicon sequence variant table (ASV) table, a higher-resolution version of the OTU table produced by traditional methods.
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+#Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+```
+```{r}
+#The core dada method corrects substitution and indel errors, but chimeras remain. Fortunately, the accuracy of sequence variants after denoising makes identifying chimeric ASVs simpler than when dealing with fuzzy OTUs. Chimeric sequences are identified if they can be exactly reconstructed by combining a left-segment and a right-segment from two more abundant “parent” sequences.
+
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+```{r}
+#As a final check of our progress, we’ll look at the number of reads that made it through each step in the pipeline:
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
+**ASSIGN TAXONOMY**
+
+We maintain formatted training fastas for the RDP training set, GreenGenes clustered at 97% identity, and the Silva reference database, and additional trainings fastas suitable for protists and certain specific environments have been contributed. For fungal taxonomy, the General Fasta release files from the UNITE ITS database can be used as is. To follow along, download the silva_nr_v132_train_set.fa.gz file, and place it in the directory with the fastq files.
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim, "C:/Users/thaka/amplicon_datasets/silva_nr99_v138.2_toSpecies_trainset.fa.gz", multithread=TRUE)
+taxa <- addSpecies(taxa, "C:/Users/thaka/amplicon_datasets/silva_v138.2_assignSpecies.fa.gz")
+```
+```{r}
+#Let’s inspect the taxonomic assignments:
+
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+list(taxa.print)
+```
+
+**Rarefraction curves**
+```{r}
+#Here we are checking the sample and read depth from the CMO 2024 experimental samples
+#load the sample color guide
+colorid<-read.csv(file = "C:/Users/thaka/amplicon_datasets/GENICEII_amplicons/2024_sequencing/CMO2024_sampleID_colours.csv")
+rownames(colorid) <- colorid$genohubname
+colorid$colour <- as.character(colorid$colour)
+# Get unique groups and their colours
+group_names  <- unique(colorid$medium)
+group_colours <- colorid$colour[match(group_names, colorid$medium)]
+# Use rarecurve, from the Vegan package. Rarcurve expects the dataset as a dataframe so we need to use as.data.frame again:
+rarecurve(seqtab.nochim, step=100, cex=0.5, lwd=2, ylab="ASVs", label=F, col = as.vector(colorid$colour))
+abline(v=(min(rowSums((seqtab.nochim))))) #Add a vertical line to plate where the fewest #sequences/sample occurs.
+# Add a legend
+legend(
+  "bottomright",                           # placement
+  legend = group_names, # labels for samples (or groups)
+  col = as.vector(group_colours),        # same colours used above
+  lty = 1,                                 # line type matches rarecurve
+  cex = 0.8,                               # text size
+  bty = "n"                                # no box around legend
+)
+```
+
+**compiling outputs of DADA2 and handoff to phyloseq**
+```{r}
+#Creating a summary version of ASVs  TO BE COMPLETED
+# giving our seq headers more manageable names (ASV_1, ASV_2...)
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode="character")
+
+for (i in 1:dim(seqtab.nochim)[2]) {
+    asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+# making and writing out a fasta of our final ASV seqs:
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "GENICEII_CMO2024_Amplicon_ASVs_loessnonR.fa")
+```
+
+```{r}
+#HAND OFF TO PHYLOSEQ AND SUMMARY FASTA FILE OF ASVs
+samples.out <- rownames(seqtab.nochim)
+metadata<- read.csv("C:/Users/thaka/amplicon_datasets/GENICEII_amplicons/2024_sequencing/fastqfiles/16S/CMO_2024_Amplicon_Metadata_16S.csv")
+rownames(metadata) <- metadata$genohubname
+samples<- rownames(track)
+track<- cbind(samples, track)
+track<- as.data.frame(track)
+metadata<- cbind(metadata, track)
+colnames(metadata) <- make.unique(colnames(metadata))
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(metadata), 
+               tax_table(taxa))
+ps <-subset_taxa(ps, Kingdom != "")
+#It is more convenient to use short names for our ASVs (e.g. ASV21) rather than the full DNA sequence when working with some of the tables and visualizations from phyloseq, but we want to keep the full DNA sequences for other purposes like merging with other datasets or indexing into reference databases like the Earth Microbiome Project. For that reason we’ll store the DNA sequences of our ASVs in the refseq slot of the phyloseq object, and then rename our taxa to a short string. That way, the short new taxa names will appear in tables and plots, and we can still recover the DNA sequences corresponding to each ASV as needed with refseq(ps).
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+tax_table(ps) <- tax_table(ps)[, !duplicated(colnames(tax_table(ps)))]
+
+#Additional trimming
+ps<- phyloseq::prune_taxa(phyloseq::taxa_sums(ps) > 0, ps)  #Remove ASVs with zero abundance. Although DADA2 tries to reduce singletons, this is a double check.
+
+ps<- phyloseq::prune_samples(phyloseq::sample_sums(ps) > 0, ps)
+```
+
+```{r}
+metadata<- read.csv("C:/Users/thaka/amplicon_datasets/GENICEII_amplicons/2024_sequencing/fastqfiles/16S/CMO_2024_Amplicon_Metadata_16S.csv", row.names = 1)
+merged_meta <- cbind(old_meta, meta_add[rownames(old_meta), , drop = FALSE])
+sample_data(ps) <- sample_data(merged_meta)
+sample_data(ps)$day_number <- metadata[sample_names(ps), "day_number"]
+sample_data(ps)$main <- metadata[sample_names(ps), "main"]
+```
+```{r}
+#Checking for Chloroplasts and Mitochondria
+chloro_hits <- apply(tax_table(ps), 1, function(x) any(grepl("Chloroplast", x, ignore.case = TRUE)))
+# Which taxa matched?
+which(chloro_hits)
+#Checking for Chloroplasts and Mitochondria
+mito_hits <- apply(tax_table(ps), 1, function(x) any(grepl("Mitochondria", x, ignore.case = TRUE)))
+# Which taxa matched?
+which(mito_hits)
+#It seems there are mitochondria hits in the 16S samples. Lets verify these hits:
+mito_contam<-tax_table(ps)[mito_hits, "Family"]
+mito_contam<-as.data.frame(mito_contam)
+chloro_contam<-tax_table(ps)[chloro_hits, "Order"]
+chloro_contam<-as.data.frame(chloro_contam)
+write.csv(mito_contam, "Mitochondria_Contamination_CMO2024_16S.csv")
+write.csv(chloro_contam, "Chloroplast_Contamination_CMO2024_16S.csv")
+
+#Lets just do a removal of mitochondria and chloroplasts in all samples to be safe
+ps <- subset_taxa(ps, Family !="Mitochondria")
+ps<- subset_taxa(ps, Order != "Chloroplast")
+ps<- subset_taxa(ps, Kingdom != "Eukaryota")
+
+#Check that the removal worked
+#Checking for Chloroplasts and Mitochondria
+chloro_hits1 <- apply(tax_table(ps), 1, function(x) any(grepl("Chloroplast", x, ignore.case = TRUE)))
+# Which taxa matched?
+which(chloro_hits1)
+#Checking for Chloroplasts and Mitochondria
+mito_hits1 <- apply(tax_table(ps), 1, function(x) any(grepl("Mitochondria", x, ignore.case = TRUE)))
+# Which taxa matched?
+which(mito_hits1)
+eu_hits1 <- apply(tax_table(ps), 1, function(x) any(grepl("Eukaryota", x, ignore.case = TRUE)))
+which(eu_hits1)
+
+#It worked! We are good to move on
+#Remove the clutter we just created
+rm(list = grep("chloro", ls(), value = TRUE, ignore.case = TRUE))
+rm(list = grep("mito", ls(), value = TRUE, ignore.case = TRUE))
+
+total_reads<-sample_sums(ps)
+total_reads<-as.data.frame(total_reads)
+sample_data(ps)$final_reads <- total_reads[sample_names(ps), "total_reads"]
+```
+#Save phyloseq object for further analysis
+```{r}
+save(ps, file = "C:/Users/thaka/amplicon_datasets/GENICEII_amplicons/2024_sequencing/CMO_2024_Experiment_16S_Amplicon_ps_loessnonR.Rda")
+```
